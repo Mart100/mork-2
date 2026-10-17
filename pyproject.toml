@@ -5,6 +5,7 @@ description = "Mork-2, a small English and Python language model"
 requires-python = ">=3.12"
 dependencies = [
     "numpy>=2.4.6",
+    "tokenizers>=0.22",
     "torch>=2.13.0",
 ]
 

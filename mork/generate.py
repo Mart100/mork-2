@@ -12,7 +12,7 @@ from mork.checkpoint import (
 )
 from mork.config import PROJECT_ROOT
 from mork.model import GPT
-from mork.tokenizer import ByteBPETokenizer
+from mork.tokenizer import MorkTokenizer
 
 DEFAULT_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints"
 DEFAULT_TOKENIZER_PATH = PROJECT_ROOT / "data" / "tokenizer.json"
@@ -94,7 +94,7 @@ def resolve_checkpoint(path: Path | None) -> Path:
 @torch.no_grad()
 def generate(
     model: GPT,
-    tokenizer: ByteBPETokenizer,
+    tokenizer: MorkTokenizer,
     prompt: str,
     *,
     max_new_tokens: int,
@@ -153,7 +153,7 @@ def main() -> None:
     if not args.tokenizer.exists():
         raise SystemExit(f"tokenizer not found: {args.tokenizer}")
 
-    tokenizer = ByteBPETokenizer.load(args.tokenizer)
+    tokenizer = MorkTokenizer.load(args.tokenizer)
     model, _, step, loss = load_model_for_inference(checkpoint, device=args.device)
 
     print(f"loaded {checkpoint} (step {step}, loss {loss:.4f})")

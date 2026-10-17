@@ -6,10 +6,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 @dataclass
 class ModelConfig:
-    """~88M-param GPT (12 layers, width 768) for 4 GB VRAM."""
+    """~98M-param GPT (12 layers, width 768, vocab 16384) for 4 GB VRAM."""
 
     block_size: int = 512
-    vocab_size: int = 4096  # placeholder until the corpus tokenizer is trained
+    vocab_size: int = 16_384  # byte-level BPE, including the four special tokens
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
