@@ -4,6 +4,7 @@ version = "0.0.1"
 description = "Mork-2, a small English and Python language model"
 requires-python = ">=3.12"
 dependencies = [
+    "datasets>=4.0.0",
     "numpy>=2.4.6",
     "tokenizers>=0.22",
     "torch>=2.13.0",
@@ -12,6 +13,7 @@ dependencies = [
 [project.scripts]
 mork-train = "mork.train:main"
 mork-generate = "mork.generate:main"
+mork-prepare = "mork.prepare:main"
 
 [build-system]
 requires = ["hatchling"]

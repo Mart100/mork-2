@@ -61,6 +61,9 @@ class MorkTokenizer:
     def encode(self, text: str) -> list[int]:
         return self.tokenizer.encode(text).ids
 
+    def encode_batch(self, texts: list[str]) -> list[list[int]]:
+        return [enc.ids for enc in self.tokenizer.encode_batch(texts)]
+
     def decode(self, ids: list[int]) -> str:
         return self.tokenizer.decode(ids, skip_special_tokens=False)
 
