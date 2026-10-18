@@ -56,7 +56,7 @@ class TrainConfig:
 
     runs_dir: Path = PROJECT_ROOT / "runs"
     eval_every: int = 100
-    eval_batches: int = 100
+    eval_batches: int = 500
 
     # Start-of-run: shrink micro-batch (keep total_batch_size) if step time is too high.
     auto_batch_probe: bool = True
