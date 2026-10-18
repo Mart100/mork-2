@@ -71,7 +71,7 @@ def load_checkpoint(
     optimizer: torch.optim.Optimizer,
     train_loader: DataLoaderLite | None = None,
     val_loader: DataLoaderLite | None = None,
-) -> tuple[int, ModelConfig, float, str | None]:
+) -> tuple[int, ModelConfig, float, str | None, int | None]:
     device = next(raw_model.parameters()).device
     ckpt = torch.load(path, map_location=device, weights_only=False)
 
@@ -87,7 +87,8 @@ def load_checkpoint(
     model_cfg = ModelConfig(**ckpt["model_config"])
     loss = float(ckpt.get("loss", float("nan")))
     run_dir = ckpt.get("run_dir")
-    return step, model_cfg, loss, run_dir
+    saved_batch = ckpt.get("train_config", {}).get("batch_size")
+    return step, model_cfg, loss, run_dir, saved_batch
 
 
 def load_weights_only(

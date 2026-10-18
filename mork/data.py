@@ -19,6 +19,8 @@ class DataLoaderLite:
         data_dir: Path,
         *,
         shuffle_chunk_tokens: int = 0,
+        fixed_shuffle: bool = False,
+        shuffle_seed: int = 0,
     ):
         self.B = B
         self.T = T
@@ -33,13 +35,17 @@ class DataLoaderLite:
             f"(expected *_{split}_*.npy)"
         )
 
-        # Train-only: shuffle large contiguous chunks each epoch so local
-        # token order stays intact while batch order varies.
-        self.shuffle_chunk_tokens = (
-            shuffle_chunk_tokens if split == "train" and shuffle_chunk_tokens > 0 else 0
-        )
+        # Shuffle large contiguous chunks so local token order stays intact.
+        # Training draws a new order each pass. Validation keeps one order and
+        # walks through all of it, so each eval is a mixture rather than the
+        # next contiguous stretch of the file.
+        self.fixed_shuffle = fixed_shuffle
+        self.shuffle_seed = shuffle_seed
+        self.shuffle_chunk_tokens = shuffle_chunk_tokens if shuffle_chunk_tokens > 0 else 0
+        self.reshuffle_on_wrap = self.shuffle_chunk_tokens > 0 and not fixed_shuffle
         self._base_tokens: torch.Tensor | None = None
         self._chunk_perm: list[int] | None = None
+        self._perms: dict[int, list[int] | None] = {}
 
         self.current_shard = 0
         self._load_shard(self.current_shard, reshuffle=True)
@@ -48,7 +54,8 @@ class DataLoaderLite:
             f"loaded {len(self._base_tokens):,} tokens for split {split} "
             f"({len(self.shards)} shard(s)"
             + (
-                f", shuffle chunks of {self.shuffle_chunk_tokens:,} tokens)"
+                f", {'fixed ' if self.fixed_shuffle else ''}shuffle chunks of "
+                f"{self.shuffle_chunk_tokens:,} tokens)"
                 if self.shuffle_chunk_tokens
                 else ")"
             )
@@ -74,10 +81,18 @@ class DataLoaderLite:
         num_full = len(self._base_tokens) // n
         if num_full <= 1:
             self._chunk_perm = None
+            self._perms[self.current_shard] = None
             self.tokens = self._base_tokens
             return
 
-        self._chunk_perm = torch.randperm(num_full).tolist()
+        if self.fixed_shuffle:
+            generator = torch.Generator()
+            generator.manual_seed(self.shuffle_seed + self.current_shard)
+            perm = torch.randperm(num_full, generator=generator)
+        else:
+            perm = torch.randperm(num_full)
+        self._chunk_perm = perm.tolist()
+        self._perms[self.current_shard] = self._chunk_perm
         self.tokens = self._apply_perm(self._chunk_perm)
         print(
             f"shuffled {num_full} chunks "
@@ -114,6 +129,12 @@ class DataLoaderLite:
             )
 
         saved_chunk = int(state.get("shuffle_chunk_tokens", 0))
+        if self.fixed_shuffle and saved_chunk == 0:
+            print(
+                "checkpoint validation cursor has no shuffle; "
+                "scoring the shuffled holdout from the start"
+            )
+            return
         if saved_chunk != self.shuffle_chunk_tokens:
             print(
                 f"warning: checkpoint shuffle_chunk_tokens={saved_chunk} "
@@ -124,6 +145,7 @@ class DataLoaderLite:
 
         perm = state.get("chunk_perm")
         self._chunk_perm = list(perm) if perm is not None else None
+        self._perms[shard] = self._chunk_perm
         self._load_shard(shard, reshuffle=False)
 
         if not (0 <= position < len(self.tokens)):
@@ -142,13 +164,21 @@ class DataLoaderLite:
             )
         )
 
+    def _advance_shard(self) -> None:
+        nxt = (self.current_shard + 1) % len(self.shards)
+        if self.reshuffle_on_wrap:
+            self._load_shard(nxt, reshuffle=True)
+            return
+        # Fixed order: reuse the permutation from the first visit.
+        known = nxt in self._perms
+        self._chunk_perm = self._perms.get(nxt)
+        self._load_shard(nxt, reshuffle=not known)
+
     def next_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
         B, T = self.B, self.T
         needed = B * T + 1
         if self.current_position + needed > len(self.tokens):
-            self.current_shard = (self.current_shard + 1) % len(self.shards)
-            # New pass over a shard (or the only shard wrapping) → new chunk order.
-            self._load_shard(self.current_shard, reshuffle=True)
+            self._advance_shard()
             if needed > len(self.tokens):
                 raise RuntimeError(
                     f"shard {self.shards[self.current_shard]!r} has "

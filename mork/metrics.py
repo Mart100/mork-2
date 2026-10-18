@@ -53,8 +53,7 @@ class MetricsLogger:
             "train": _config_to_jsonable(train_cfg),
         }
         path = self.run_dir / "config.json"
-        if not path.exists():
-            path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     def log(
         self,

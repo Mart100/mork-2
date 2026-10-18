@@ -192,7 +192,7 @@ def probe_auto_batch(
     return optimizer
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     defaults = TrainConfig()
     parser = argparse.ArgumentParser(description="Train Mork-2.")
     parser.add_argument(
@@ -257,7 +257,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable torch.compile.",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def configs_from_args(
@@ -354,11 +354,16 @@ def estimate_loss(
 
 
 def main(
+    argv: list[str] | None = None,
     train_cfg: TrainConfig | None = None,
     model_cfg: ModelConfig | None = None,
 ) -> None:
-    train_cfg = train_cfg or TrainConfig()
-    model_cfg = model_cfg or ModelConfig()
+    # The console script calls main() with no configs, so flags have to be read here.
+    if train_cfg is None and model_cfg is None:
+        train_cfg, model_cfg = configs_from_args(parse_args(argv))
+    else:
+        train_cfg = train_cfg or TrainConfig()
+        model_cfg = model_cfg or ModelConfig()
 
     if train_cfg.seq_len > model_cfg.block_size:
         raise ValueError(
@@ -372,6 +377,10 @@ def main(
     if device == "cuda":
         torch.cuda.manual_seed(train_cfg.seed)
 
+    print(
+        f"max_steps={train_cfg.max_steps:,}  max_lr={train_cfg.max_lr:.4e}  "
+        f"warmup={train_cfg.warmup_steps}"
+    )
     print(f"total desired batch size: {train_cfg.total_batch_size:,}")
     print(f"=> calculated gradient accumulation steps: {train_cfg.grad_accum_steps:,}")
 
@@ -387,6 +396,9 @@ def main(
         T=train_cfg.seq_len,
         split="val",
         data_dir=train_cfg.data_dir,
+        shuffle_chunk_tokens=train_cfg.shuffle_chunk_tokens,
+        fixed_shuffle=True,
+        shuffle_seed=train_cfg.seed,
     )
 
     torch.set_float32_matmul_precision("high")
@@ -397,12 +409,13 @@ def main(
     )
 
     start_step = 0
+    saved_batch: int | None = None
     checkpoint_run_dir: str | None = None
     latest_path = latest_checkpoint_path(train_cfg.checkpoint_dir)
     init_from = train_cfg.init_from
 
     if train_cfg.resume and latest_path is not None:
-        loaded_step, loaded_model_cfg, loaded_loss, checkpoint_run_dir = load_checkpoint(
+        loaded_step, loaded_model_cfg, loaded_loss, checkpoint_run_dir, saved_batch = load_checkpoint(
             latest_path,
             raw_model,
             optimizer,
@@ -472,7 +485,11 @@ def main(
 
     dtype = torch.bfloat16 if train_cfg.dtype == "bfloat16" else torch.float16
 
-    if train_cfg.auto_batch_probe:
+    if saved_batch is not None and saved_batch != train_cfg.batch_size:
+        _set_micro_batch(train_cfg, train_loader, val_loader, int(saved_batch))
+        print(f"restored micro-batch {saved_batch} from checkpoint")
+
+    if train_cfg.auto_batch_probe and start_step == 0:
         optimizer = probe_auto_batch(
             model=model,
             raw_model=raw_model,
@@ -642,5 +659,4 @@ def main(
 
 
 if __name__ == "__main__":
-    train_cfg, model_cfg = configs_from_args(parse_args())
-    main(train_cfg=train_cfg, model_cfg=model_cfg)
+    main()
