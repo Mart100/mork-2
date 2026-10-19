@@ -62,7 +62,7 @@ class TrainConfig:
     # Log to runs/<run_name>; otherwise reuse the checkpoint's run on resume.
     run_name: str | None = None
     eval_every: int = 100
-    eval_batches: int = 500
+    eval_batches: int = 1000
 
     # Start-of-run: shrink micro-batch (keep total_batch_size) if step time is too high.
     auto_batch_probe: bool = True
