@@ -21,8 +21,10 @@ class ModelConfig:
 class TrainConfig:
     """Training defaults for 4 GB VRAM: micro-batch 16, seq 512, 32k tokens/step.
 
-    The auto-batch probe may shrink the micro-batch. ``max_steps`` is a short
-    default; set the real token budget on the CLI once shards exist.
+    The auto-batch probe may shrink the micro-batch. ``max_steps`` only says
+    where training stops. After warmup the learning rate holds at ``max_lr``
+    until ``cooldown_start``, then falls linearly to ``min_lr`` over
+    ``cooldown_steps``.
     """
 
     data_dir: Path = PROJECT_ROOT / "data"
@@ -37,9 +39,11 @@ class TrainConfig:
     shuffle_chunk_tokens: int = 32_768
 
     max_lr: float = 8e-4  # peak LR from the 88M pretrain
-    min_lr_ratio: float = 0.2
+    min_lr_ratio: float = 0.0  # cooldown target as a fraction of max_lr
     warmup_steps: int = 100
     max_steps: int = 4000
+    cooldown_start: int | None = None  # None holds max_lr until max_steps
+    cooldown_steps: int = 2000
     weight_decay: float = 0.1
     grad_clip: float = 1.0
 
@@ -55,6 +59,8 @@ class TrainConfig:
     init_from: Path | None = None
 
     runs_dir: Path = PROJECT_ROOT / "runs"
+    # Log to runs/<run_name>; otherwise reuse the checkpoint's run on resume.
+    run_name: str | None = None
     eval_every: int = 100
     eval_batches: int = 500
 

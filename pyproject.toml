@@ -14,6 +14,7 @@ dependencies = [
 mork-train = "mork.train:main"
 mork-generate = "mork.generate:main"
 mork-prepare = "mork.prepare:main"
+mork-eval = "mork.evaluate:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -108,9 +108,11 @@ def load_weights_only(
 def load_model_for_inference(
     path: Path, device: str = "cuda"
 ) -> tuple[GPT, ModelConfig, int, float]:
-    ckpt = torch.load(path, map_location=device, weights_only=False)
+    # mmap on CPU so the optimizer state is never read into RAM or VRAM.
+    ckpt = torch.load(path, map_location="cpu", mmap=True, weights_only=False)
     model_cfg = ModelConfig(**ckpt["model_config"])
-    model = GPT(model_cfg).to(device)
+    with torch.device(device):
+        model = GPT(model_cfg)
     model.load_state_dict(ckpt["model"])
     model.eval()
     step = int(ckpt["step"])
@@ -122,7 +124,7 @@ def load_best_val_loss(checkpoint_dir: Path) -> tuple[float, int] | None:
     path = best_val_checkpoint_path(checkpoint_dir)
     if path is None:
         return None
-    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    ckpt = torch.load(path, map_location="cpu", mmap=True, weights_only=False)
     val_loss = ckpt.get("val_loss")
     if val_loss is None:
         return None

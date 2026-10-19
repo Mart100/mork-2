@@ -1,5 +1,4 @@
 import argparse
-import math
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -215,7 +214,36 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--max-steps",
         type=int,
         default=None,
-        help=f"Optimizer steps (default: {defaults.max_steps}).",
+        help=f"Step to stop training at (default: {defaults.max_steps}).",
+    )
+    parser.add_argument(
+        "--cooldown-start",
+        type=int,
+        default=None,
+        help=(
+            "Step where the LR starts its linear decay to min_lr "
+            "(default: none, constant LR)."
+        ),
+    )
+    parser.add_argument(
+        "--cooldown-steps",
+        type=int,
+        default=None,
+        help=f"Length of the linear cooldown (default: {defaults.cooldown_steps}).",
+    )
+    parser.add_argument(
+        "--min-lr-ratio",
+        type=float,
+        default=None,
+        help=f"Cooldown target as a fraction of max_lr (default: {defaults.min_lr_ratio}).",
+    )
+    parser.add_argument(
+        "--run-name",
+        default=None,
+        help=(
+            "Log to runs/<run-name> (created if missing). Default: reuse the "
+            "checkpoint's run on resume, else a new timestamped run."
+        ),
     )
     parser.add_argument(
         "--max-lr",
@@ -272,6 +300,16 @@ def configs_from_args(
         overrides["init_from"] = args.init_from
     if args.max_steps is not None:
         overrides["max_steps"] = args.max_steps
+    if args.cooldown_start is not None:
+        overrides["cooldown_start"] = args.cooldown_start
+    if args.cooldown_steps is not None:
+        if args.cooldown_steps <= 0:
+            raise SystemExit("--cooldown-steps must be positive")
+        overrides["cooldown_steps"] = args.cooldown_steps
+    if args.min_lr_ratio is not None:
+        overrides["min_lr_ratio"] = args.min_lr_ratio
+    if args.run_name is not None:
+        overrides["run_name"] = args.run_name
     if args.max_lr is not None:
         overrides["max_lr"] = args.max_lr
     if args.warmup_steps is not None:
@@ -323,12 +361,31 @@ def configure_optimizers(
 def get_lr(step: int, cfg: TrainConfig) -> float:
     if step < cfg.warmup_steps:
         return cfg.max_lr * step / cfg.warmup_steps
-    if step > cfg.max_steps:
-        return cfg.min_lr
-    decay_ratio = (step - cfg.warmup_steps) / (cfg.max_steps - cfg.warmup_steps)
-    assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-    return cfg.min_lr + coeff * (cfg.max_lr - cfg.min_lr)
+    if cfg.cooldown_start is None or step < cfg.cooldown_start:
+        return cfg.max_lr
+    progress = min(1.0, (step - cfg.cooldown_start) / cfg.cooldown_steps)
+    return cfg.max_lr - progress * (cfg.max_lr - cfg.min_lr)
+
+
+def describe_schedule(cfg: TrainConfig, start_step: int) -> str:
+    if cfg.cooldown_start is None:
+        return (
+            f"lr: constant {cfg.max_lr:.4e} after {cfg.warmup_steps} warmup steps, "
+            f"no cooldown; stops at step {cfg.max_steps:,}"
+        )
+    end = cfg.cooldown_start + cfg.cooldown_steps
+    text = (
+        f"lr: constant {cfg.max_lr:.4e} until step {cfg.cooldown_start:,}, "
+        f"then linear to {cfg.min_lr:.4e} by step {end:,}; stops at step {cfg.max_steps:,}"
+    )
+    if cfg.max_steps < end:
+        text += (
+            f"\nwarning: max_steps ends the run before the cooldown finishes; "
+            f"the last lr will be {get_lr(cfg.max_steps - 1, cfg):.4e}"
+        )
+    if start_step > cfg.cooldown_start:
+        text += f"\nnote: resuming inside the cooldown at lr {get_lr(start_step, cfg):.4e}"
+    return text
 
 
 @torch.no_grad()
@@ -377,10 +434,6 @@ def main(
     if device == "cuda":
         torch.cuda.manual_seed(train_cfg.seed)
 
-    print(
-        f"max_steps={train_cfg.max_steps:,}  max_lr={train_cfg.max_lr:.4e}  "
-        f"warmup={train_cfg.warmup_steps}"
-    )
     print(f"total desired batch size: {train_cfg.total_batch_size:,}")
     print(f"=> calculated gradient accumulation steps: {train_cfg.grad_accum_steps:,}")
 
@@ -470,6 +523,8 @@ def main(
             f"tracking best val from checkpoint: "
             f"val_loss {best_val_loss:.6f} (step {best_val_step})"
         )
+
+    print(describe_schedule(train_cfg, start_step))
 
     run_dir = resolve_run_dir(
         train_cfg,

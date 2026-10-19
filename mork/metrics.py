@@ -94,7 +94,11 @@ def resolve_run_dir(
     resume: bool,
     checkpoint_run_dir: str | None = None,
 ) -> Path:
-    """Reuse checkpoint run dir on resume; otherwise create a new run folder."""
+    """Pick runs/<run_name> if set, else the checkpoint's run on resume, else a new run."""
+    if train_cfg.run_name:
+        run_dir = train_cfg.runs_dir / train_cfg.run_name
+        run_dir.mkdir(parents=True, exist_ok=True)
+        return run_dir
     if resume and checkpoint_run_dir:
         run_dir = Path(checkpoint_run_dir)
         if run_dir.exists():
