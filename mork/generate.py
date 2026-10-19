@@ -135,13 +135,16 @@ def generate(
     elapsed_s = time.perf_counter() - t0
     new_tokens = int(idx.size(1) - prompt_len)
     tokens_per_sec = new_tokens / elapsed_s if elapsed_s > 0 else 0.0
+    ids = idx[0].tolist()
     stats = {
         "prompt_tokens": prompt_len,
         "new_tokens": new_tokens,
         "elapsed_ms": elapsed_s * 1000.0,
         "tokens_per_sec": tokens_per_sec,
+        "prompt_text": tokenizer.decode(ids[:prompt_len]),
+        "generated_text": tokenizer.decode(ids[prompt_len:]).rstrip(),
     }
-    return tokenizer.decode(idx[0].tolist()).rstrip(), stats
+    return tokenizer.decode(ids).rstrip(), stats
 
 
 def main() -> None:
