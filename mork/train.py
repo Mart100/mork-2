@@ -6,6 +6,7 @@ from pathlib import Path
 import torch
 
 from mork.checkpoint import (
+    best_val_checkpoint_path,
     latest_checkpoint_path,
     load_best_val_loss,
     load_checkpoint,
@@ -13,6 +14,7 @@ from mork.checkpoint import (
     maybe_save_best_val,
     maybe_save_checkpoints,
     save_checkpoint,
+    val_slice_tag,
 )
 from mork.config import ModelConfig, TrainConfig
 from mork.data import DataLoaderLite
@@ -397,6 +399,8 @@ def estimate_loss(
     dtype: torch.dtype,
     num_batches: int,
 ) -> float:
+    """Mean loss on the first ``num_batches`` of ``loader``: the same tokens every call."""
+    loader.reset()
     model.eval()
     losses = torch.zeros(num_batches, device=device)
     for i in range(num_batches):
@@ -516,8 +520,14 @@ def main(
         print(f"found {latest_path} but resume=False, training from scratch")
 
     best_val_loss = float("inf")
-    best_val_info = load_best_val_loss(train_cfg.checkpoint_dir)
-    if best_val_info is not None and train_cfg.resume and start_step > 0:
+    best_val_info = load_best_val_loss(train_cfg.checkpoint_dir, val_slice_tag(train_cfg))
+    resuming = train_cfg.resume and start_step > 0
+    if resuming and best_val_info is None and best_val_checkpoint_path(train_cfg.checkpoint_dir):
+        print(
+            "best_val.pt was scored on a different val slice; "
+            "the first eval of this run sets a new best"
+        )
+    if best_val_info is not None and resuming:
         best_val_loss, best_val_step = best_val_info
         print(
             f"tracking best val from checkpoint: "
@@ -635,7 +645,7 @@ def main(
                 elapsed_s = time.time() - run_t0
                 print(
                     f"step {step:4d} | val_loss {val_loss:.6f} "
-                    f"({train_cfg.eval_batches} batches) | "
+                    f"(fixed {train_cfg.eval_tokens:,} tokens) | "
                     f"elapsed {_format_elapsed(elapsed_s)}"
                 )
                 metrics.log(

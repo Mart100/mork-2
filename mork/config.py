@@ -62,7 +62,8 @@ class TrainConfig:
     # Log to runs/<run_name>; otherwise reuse the checkpoint's run on resume.
     run_name: str | None = None
     eval_every: int = 100
-    eval_batches: int = 1000
+    # Every eval scores the same first eval_tokens of the shuffled val stream.
+    eval_tokens: int = 1_024_000
 
     # Start-of-run: shrink micro-batch (keep total_batch_size) if step time is too high.
     auto_batch_probe: bool = True
@@ -77,6 +78,10 @@ class TrainConfig:
             f"batch_size * seq_len ({micro_batch_tokens})"
         )
         return self.total_batch_size // micro_batch_tokens
+
+    @property
+    def eval_batches(self) -> int:
+        return max(1, self.eval_tokens // (self.batch_size * self.seq_len))
 
     @property
     def min_lr(self) -> float:

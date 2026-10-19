@@ -1,17 +1,20 @@
-"""Executable Python function benchmark for Mork-2 checkpoints.
+"""Milestone evaluation for Mork-2 checkpoints: held-out loss and Python functions.
 
-The model continues a function header and docstring. The body is cut at the
-first unindented line, then run with the task's asserts in a subprocess
-(``python -I``, temp cwd, 5 s timeout). This is isolation from the eval
-process, not a security sandbox.
+Code tasks: the model continues a function header and docstring. The body is
+cut at the first unindented line, then run with the task's asserts in a
+subprocess (``python -I``, temp cwd, 5 s timeout). This is isolation from the
+eval process, not a security sandbox.
 
 Task sets:
+  loss   Loss on the first --val-tokens of the shuffled val stream (a superset
+         of the slice the trainer scores), plus per-source loss on windows of
+         data/raw/{python,cosmopedia,fineweb}_val.jsonl.
   smoke  20 hand-written beginner functions, 10 samples each by default.
   mbpp   MBPP sanitized test split (257 tasks), 5 samples each by default.
          Evaluation only; never put MBPP into training data.
 
-Each checkpoint appends one row to ``<run_dir>/code_eval.csv`` (the run that
-wrote the checkpoint), or to ``--out``.
+Each checkpoint appends one row per task set to ``loss_eval.csv`` or
+``code_eval.csv`` in the run that wrote the checkpoint, or in ``--out-dir``.
 """
 
 import argparse
@@ -31,14 +34,34 @@ import torch
 import torch.nn.functional as F
 
 from mork.checkpoint import load_model_for_inference
-from mork.config import PROJECT_ROOT
+from mork.config import PROJECT_ROOT, TrainConfig
+from mork.data import DataLoaderLite
 from mork.generate import DEFAULT_TOKENIZER_PATH, toplevel_cut
 from mork.model import GPT
 from mork.tokenizer import MorkTokenizer
 
 DEFAULT_CHECKPOINT = PROJECT_ROOT / "checkpoints" / "latest.pt"
-FALLBACK_CSV = PROJECT_ROOT / "runs" / "code_eval.csv"
+FALLBACK_DIR = PROJECT_ROOT / "runs"
+RAW_DIR = PROJECT_ROOT / "data" / "raw"
 DEFAULT_SAMPLES = {"smoke": 10, "mbpp": 5}
+DEFAULT_MAX_NEW_TOKENS = {"smoke": 128, "mbpp": 160}
+
+SOURCES = ("python", "cosmopedia", "fineweb")
+LOSS_BATCH = 8
+SOURCE_WINDOWS = 200
+SOURCE_DOCS = 160
+SOURCE_MAX_DOC_TOKENS = 1024
+
+LOSS_CSV_FIELDS = [
+    "time",
+    "checkpoint",
+    "step",
+    "val_tokens",
+    "val_loss",
+    "val_train_slice",
+    *SOURCES,
+    "elapsed_s",
+]
 
 CSV_FIELDS = [
     "time",
@@ -322,14 +345,89 @@ def checkpoint_run_dir(path: Path) -> Path | None:
     return Path(run_dir)
 
 
-def append_csv(path: Path, row: dict) -> None:
+def append_csv(path: Path, row: dict, fields: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     is_new = not path.exists()
     with path.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        writer = csv.DictWriter(f, fieldnames=fields)
         if is_new:
             writer.writeheader()
         writer.writerow(row)
+
+
+@dataclass
+class LossData:
+    val_batches: list[tuple[torch.Tensor, torch.Tensor]]
+    train_slice_batches: int  # leading batches that equal the trainer's eval slice
+    source_windows: dict[str, torch.Tensor]
+
+
+def build_loss_data(tokenizer: MorkTokenizer, val_tokens: int) -> LossData:
+    cfg = TrainConfig()
+    batch_tokens = LOSS_BATCH * cfg.seq_len
+    loader = DataLoaderLite(
+        B=LOSS_BATCH,
+        T=cfg.seq_len,
+        split="val",
+        data_dir=cfg.data_dir,
+        shuffle_chunk_tokens=cfg.shuffle_chunk_tokens,
+        fixed_shuffle=True,
+        shuffle_seed=cfg.seed,
+    )
+    n_batches = max(1, val_tokens // batch_tokens)
+    val_batches = [loader.next_batch() for _ in range(n_batches)]
+    del loader
+    train_slice = cfg.eval_tokens // batch_tokens if cfg.eval_tokens % batch_tokens == 0 else 0
+    if train_slice > n_batches:
+        train_slice = 0
+
+    end_id = tokenizer.special_token_id("<|end|>")
+    windows: dict[str, torch.Tensor] = {}
+    for source in SOURCES:
+        path = RAW_DIR / f"{source}_val.jsonl"
+        meta_path = RAW_DIR / f"{source}_val.meta.json"
+        if not path.exists():
+            print(f"loss: {path} missing, skipping {source}")
+            continue
+        n_docs = 0
+        if meta_path.exists():
+            n_docs = int(json.loads(meta_path.read_text()).get("docs", 0))
+        if n_docs <= 0:
+            with path.open(encoding="utf-8") as f:
+                n_docs = sum(1 for _ in f)
+        stride = max(1, n_docs // SOURCE_DOCS)
+        stream: list[int] = []
+        with path.open(encoding="utf-8") as f:
+            for i, line in enumerate(f):
+                if i % stride == 0:
+                    ids = tokenizer.encode(json.loads(line)["text"])[:SOURCE_MAX_DOC_TOKENS]
+                    stream.extend(ids + [end_id])
+        width = cfg.seq_len + 1
+        n = min(SOURCE_WINDOWS, len(stream) // width)
+        windows[source] = torch.tensor(stream[: n * width], dtype=torch.long).view(n, width)
+    return LossData(val_batches, train_slice, windows)
+
+
+@torch.no_grad()
+def evaluate_loss(model: GPT, data: LossData, device: str) -> dict[str, float]:
+    def batch_loss(x: torch.Tensor, y: torch.Tensor) -> float:
+        with torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=device == "cuda"):
+            _, loss = model(x.to(device), y.to(device))
+        return float(loss)
+
+    losses = [batch_loss(x, y) for x, y in data.val_batches]
+    result = {"val_loss": sum(losses) / len(losses)}
+    if data.train_slice_batches:
+        head = losses[: data.train_slice_batches]
+        result["val_train_slice"] = sum(head) / len(head)
+    for source, arr in data.source_windows.items():
+        total = count = 0.0
+        for i in range(0, len(arr), LOSS_BATCH):
+            batch = arr[i : i + LOSS_BATCH]
+            total += batch_loss(batch[:, :-1], batch[:, 1:]) * len(batch)
+            count += len(batch)
+        result[source] = total / count
+    return result
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -342,23 +440,35 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=[DEFAULT_CHECKPOINT],
         help="One or more checkpoint files (default: checkpoints/latest.pt).",
     )
-    parser.add_argument("--tasks", choices=["smoke", "mbpp"], default="smoke")
+    parser.add_argument(
+        "--tasks",
+        choices=["loss", "smoke", "mbpp"],
+        nargs="+",
+        default=["smoke"],
+        help="Task sets to run, e.g. --tasks loss smoke (default: smoke).",
+    )
+    parser.add_argument(
+        "--val-tokens",
+        type=int,
+        default=4_096_000,
+        help="Mixed val tokens for --tasks loss (default: 4,096,000).",
+    )
     parser.add_argument(
         "--samples",
         "-n",
         type=int,
         default=None,
-        help="Sampled completions per task, besides greedy (default: smoke 10, mbpp 5).",
+        help="Sampled completions per code task, besides greedy (default: smoke 10, mbpp 5).",
     )
     parser.add_argument("--temperature", "-t", type=float, default=0.8)
     parser.add_argument("--top-k", type=int, default=50)
     parser.add_argument("--max-new-tokens", type=int, default=None, help="Default: smoke 128, mbpp 160.")
-    parser.add_argument("--limit", type=int, default=None, help="Only the first N tasks.")
+    parser.add_argument("--limit", type=int, default=None, help="Only the first N code tasks.")
     parser.add_argument(
-        "--out",
+        "--out-dir",
         type=Path,
         default=None,
-        help="CSV to append to (default: <checkpoint run_dir>/code_eval.csv).",
+        help="Directory for loss_eval.csv / code_eval.csv (default: the checkpoint's run dir).",
     )
     parser.add_argument("--details", type=Path, default=None, help="Also write per-task JSON here.")
     parser.add_argument("--tokenizer", type=Path, default=DEFAULT_TOKENIZER_PATH)
@@ -366,11 +476,90 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--verbose", "-v", action="store_true", help="Print one line per task.")
     args = parser.parse_args(argv)
-    if args.samples is None:
-        args.samples = DEFAULT_SAMPLES[args.tasks]
-    if args.max_new_tokens is None:
-        args.max_new_tokens = 128 if args.tasks == "smoke" else 160
+    args.tasks = list(dict.fromkeys(args.tasks))
     return args
+
+
+def run_code_tasks(
+    model: GPT,
+    tokenizer: MorkTokenizer,
+    name: str,
+    tasks: list[Task],
+    args: argparse.Namespace,
+    path: Path,
+    step: int,
+    out_dir: Path,
+) -> dict:
+    samples = args.samples if args.samples is not None else DEFAULT_SAMPLES[name]
+    max_new = args.max_new_tokens or DEFAULT_MAX_NEW_TOKENS[name]
+    t0 = time.time()
+    summary, per_task = evaluate_tasks(
+        model,
+        tokenizer,
+        tasks,
+        samples=samples,
+        temperature=args.temperature,
+        top_k=args.top_k,
+        max_new_tokens=max_new,
+        device=args.device,
+        seed=args.seed,
+        verbose=args.verbose,
+    )
+    elapsed = time.time() - t0
+    n = summary["n_tasks"]
+    print(
+        f"  {name}: greedy {summary['greedy_pass']}/{n} "
+        f"(syntax {summary['greedy_syntax']}/{n}), "
+        f"sampled pass@1 {summary['sample_pass_at_1']:.3f}, "
+        f"pass@{samples} {summary['tasks_solved']}/{n}, "
+        f"sample syntax {summary['sample_syntax_rate']:.2f} [{elapsed:.0f}s]",
+        flush=True,
+    )
+    append_csv(
+        out_dir / "code_eval.csv",
+        {
+            "time": datetime.now(timezone.utc).isoformat(),
+            "checkpoint": str(path),
+            "step": step,
+            "tasks": name if args.limit is None else f"{name}[:{args.limit}]",
+            "samples": samples,
+            "temperature": args.temperature,
+            "top_k": args.top_k,
+            "sample_pass_at_1": f"{summary['sample_pass_at_1']:.4f}",
+            "sample_syntax_rate": f"{summary['sample_syntax_rate']:.4f}",
+            "elapsed_s": f"{elapsed:.1f}",
+            **{k: summary[k] for k in ("n_tasks", "greedy_pass", "greedy_syntax", "tasks_solved")},
+        },
+        CSV_FIELDS,
+    )
+    return {"summary": summary, "per_task": per_task}
+
+
+def run_loss_task(
+    model: GPT, data: LossData, args: argparse.Namespace, path: Path, step: int, out_dir: Path
+) -> dict:
+    t0 = time.time()
+    result = evaluate_loss(model, data, args.device)
+    elapsed = time.time() - t0
+    val_tokens = len(data.val_batches) * data.val_batches[0][0].numel()
+    parts = [f"val {result['val_loss']:.4f} ({val_tokens:,} tokens)"]
+    if "val_train_slice" in result:
+        parts.append(f"trainer slice {result['val_train_slice']:.4f}")
+    parts += [f"{s} {result[s]:.4f}" for s in SOURCES if s in result]
+    print(f"  loss: {', '.join(parts)} [{elapsed:.0f}s]", flush=True)
+    append_csv(
+        out_dir / "loss_eval.csv",
+        {
+            "time": datetime.now(timezone.utc).isoformat(),
+            "checkpoint": str(path),
+            "step": step,
+            "val_tokens": val_tokens,
+            "elapsed_s": f"{elapsed:.1f}",
+            **{k: f"{v:.6f}" for k, v in result.items()},
+        },
+        LOSS_CSV_FIELDS,
+    )
+    return result
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -381,67 +570,36 @@ def main(argv: list[str] | None = None) -> None:
 
     torch.set_float32_matmul_precision("high")
     tokenizer = MorkTokenizer.load(args.tokenizer)
-    tasks = smoke_tasks() if args.tasks == "smoke" else mbpp_tasks()
-    if args.limit is not None:
-        tasks = tasks[: args.limit]
-    print(
-        f"{args.tasks}: {len(tasks)} tasks, greedy + {args.samples} samples "
-        f"(temperature {args.temperature}, top-k {args.top_k})"
-    )
+    code_sets: dict[str, list[Task]] = {}
+    for name in args.tasks:
+        if name == "loss":
+            continue
+        tasks = smoke_tasks() if name == "smoke" else mbpp_tasks()
+        code_sets[name] = tasks[: args.limit] if args.limit is not None else tasks
+        samples = args.samples if args.samples is not None else DEFAULT_SAMPLES[name]
+        print(
+            f"{name}: {len(code_sets[name])} tasks, greedy + {samples} samples "
+            f"(temperature {args.temperature}, top-k {args.top_k})"
+        )
+    loss_data = build_loss_data(tokenizer, args.val_tokens) if "loss" in args.tasks else None
 
     details: dict[str, dict] = {}
     for path in args.checkpoint:
-        t0 = time.time()
         model, _, step, _ = load_model_for_inference(path, device=args.device)
-        summary, per_task = evaluate_tasks(
-            model,
-            tokenizer,
-            tasks,
-            samples=args.samples,
-            temperature=args.temperature,
-            top_k=args.top_k,
-            max_new_tokens=args.max_new_tokens,
-            device=args.device,
-            seed=args.seed,
-            verbose=args.verbose,
-        )
+        out_dir = args.out_dir or checkpoint_run_dir(path) or FALLBACK_DIR
+        print(f"{path} (step {step}) -> {out_dir}", flush=True)
+        details[str(path)] = {"step": step}
+        for name in args.tasks:
+            if name == "loss":
+                assert loss_data is not None
+                details[str(path)][name] = run_loss_task(model, loss_data, args, path, step, out_dir)
+            else:
+                details[str(path)][name] = run_code_tasks(
+                    model, tokenizer, name, code_sets[name], args, path, step, out_dir
+                )
         del model
         if args.device == "cuda":
             torch.cuda.empty_cache()
-        elapsed = time.time() - t0
-
-        n = summary["n_tasks"]
-        print(
-            f"{path} (step {step}): greedy {summary['greedy_pass']}/{n} "
-            f"(syntax {summary['greedy_syntax']}/{n}), "
-            f"sampled pass@1 {summary['sample_pass_at_1']:.3f}, "
-            f"pass@{args.samples} {summary['tasks_solved']}/{n}, "
-            f"sample syntax {summary['sample_syntax_rate']:.2f} [{elapsed:.0f}s]",
-            flush=True,
-        )
-
-        out = args.out
-        if out is None:
-            run_dir = checkpoint_run_dir(path)
-            out = run_dir / "code_eval.csv" if run_dir is not None else FALLBACK_CSV
-        append_csv(
-            out,
-            {
-                "time": datetime.now(timezone.utc).isoformat(),
-                "checkpoint": str(path),
-                "step": step,
-                "tasks": args.tasks if args.limit is None else f"{args.tasks}[:{args.limit}]",
-                "samples": args.samples,
-                "temperature": args.temperature,
-                "top_k": args.top_k,
-                "sample_pass_at_1": f"{summary['sample_pass_at_1']:.4f}",
-                "sample_syntax_rate": f"{summary['sample_syntax_rate']:.4f}",
-                "elapsed_s": f"{elapsed:.1f}",
-                **{k: summary[k] for k in ("n_tasks", "greedy_pass", "greedy_syntax", "tasks_solved")},
-            },
-        )
-        print(f"appended to {out}")
-        details[str(path)] = {"step": step, "summary": summary, "per_task": per_task}
 
     if args.details is not None:
         args.details.parent.mkdir(parents=True, exist_ok=True)

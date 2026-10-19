@@ -36,9 +36,8 @@ class DataLoaderLite:
         )
 
         # Shuffle large contiguous chunks so local token order stays intact.
-        # Training draws a new order each pass. Validation keeps one order and
-        # walks through all of it, so each eval is a mixture rather than the
-        # next contiguous stretch of the file.
+        # Training draws a new order each pass. Validation keeps one seeded
+        # order, so reset() always returns the same mixed slice.
         self.fixed_shuffle = fixed_shuffle
         self.shuffle_seed = shuffle_seed
         self.shuffle_chunk_tokens = shuffle_chunk_tokens if shuffle_chunk_tokens > 0 else 0
@@ -110,6 +109,13 @@ class DataLoaderLite:
         if len(remainder) > 0:
             chunks.append(remainder)
         return torch.cat(chunks)
+
+    def reset(self) -> None:
+        """Rewind to the first batch. With ``fixed_shuffle`` the order is identical each time."""
+        if self.current_shard != 0:
+            self._chunk_perm = self._perms.get(0)
+            self._load_shard(0, reshuffle=0 not in self._perms)
+        self.current_position = 0
 
     def state_dict(self) -> dict:
         return {

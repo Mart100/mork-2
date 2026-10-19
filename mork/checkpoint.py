@@ -18,6 +18,14 @@ def _train_config_to_dict(cfg: TrainConfig) -> dict:
     return data
 
 
+def val_slice_tag(cfg: TrainConfig) -> str:
+    """Identifies the val tokens a val_loss was measured on; losses only compare within a tag."""
+    return (
+        f"fixed:{cfg.eval_tokens}:seq{cfg.seq_len}:"
+        f"chunk{cfg.shuffle_chunk_tokens}:seed{cfg.seed}"
+    )
+
+
 def latest_checkpoint_path(checkpoint_dir: Path) -> Path | None:
     path = checkpoint_dir / "latest.pt"
     return path if path.exists() else None
@@ -41,6 +49,7 @@ def save_checkpoint(
     val_loader: DataLoaderLite | None = None,
     run_dir: Path | None = None,
     val_loss: float | None = None,
+    val_slice: str | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -53,6 +62,8 @@ def save_checkpoint(
     }
     if val_loss is not None:
         payload["val_loss"] = val_loss
+    if val_slice is not None:
+        payload["val_slice"] = val_slice
     if train_loader is not None:
         payload["train_loader"] = train_loader.state_dict()
     if val_loader is not None:
@@ -120,13 +131,14 @@ def load_model_for_inference(
     return model, model_cfg, step, loss
 
 
-def load_best_val_loss(checkpoint_dir: Path) -> tuple[float, int] | None:
+def load_best_val_loss(checkpoint_dir: Path, val_slice: str) -> tuple[float, int] | None:
+    """Best val loss so far, or None if best_val.pt was scored on another slice."""
     path = best_val_checkpoint_path(checkpoint_dir)
     if path is None:
         return None
     ckpt = torch.load(path, map_location="cpu", mmap=True, weights_only=False)
     val_loss = ckpt.get("val_loss")
-    if val_loss is None:
+    if val_loss is None or ckpt.get("val_slice") != val_slice:
         return None
     return float(val_loss), int(ckpt["step"])
 
@@ -164,6 +176,7 @@ def maybe_save_best_val(
         val_loader=val_loader,
         run_dir=run_dir,
         val_loss=val_loss,
+        val_slice=val_slice_tag(train_cfg),
     )
     print(
         f"saved best-val checkpoint: {path} "
