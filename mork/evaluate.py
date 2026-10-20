@@ -10,6 +10,8 @@ Task sets:
          of the slice the trainer scores), plus per-source loss on windows of
          data/raw/{python,cosmopedia,fineweb}_val.jsonl.
   smoke  20 hand-written beginner functions, 10 samples each by default.
+  mid    160 hand-written mid-difficulty functions (mork/eval_mid.py),
+         5 samples each by default.
   mbpp   MBPP sanitized test split (257 tasks), 5 samples each by default.
          Evaluation only; never put MBPP into training data.
 
@@ -38,6 +40,7 @@ import torch.nn.functional as F
 from mork.checkpoint import load_model_for_inference
 from mork.config import PROJECT_ROOT, TrainConfig
 from mork.data import DataLoaderLite
+from mork.eval_mid import mid_task_items
 from mork.generate import DEFAULT_TOKENIZER_PATH, toplevel_cut
 from mork.model import GPT
 from mork.tokenizer import MorkTokenizer
@@ -45,8 +48,8 @@ from mork.tokenizer import MorkTokenizer
 DEFAULT_CHECKPOINT = PROJECT_ROOT / "checkpoints" / "latest.pt"
 FALLBACK_DIR = PROJECT_ROOT / "runs"
 RAW_DIR = PROJECT_ROOT / "data" / "raw"
-DEFAULT_SAMPLES = {"smoke": 10, "mbpp": 5}
-DEFAULT_MAX_NEW_TOKENS = {"smoke": 128, "mbpp": 160}
+DEFAULT_SAMPLES = {"smoke": 10, "mid": 5, "mbpp": 5}
+DEFAULT_MAX_NEW_TOKENS = {"smoke": 128, "mid": 160, "mbpp": 160}
 
 SOURCES = ("python", "cosmopedia", "fineweb")
 LOSS_BATCH = 8
@@ -140,6 +143,10 @@ IMPORT_RE = re.compile(r"^(?:import|from)\s+\S.*$", re.MULTILINE)
 
 def smoke_tasks() -> list[Task]:
     return [Task(name, prompt, tests) for name, prompt, tests in SMOKE_TASKS]
+
+
+def mid_tasks() -> list[Task]:
+    return [Task(name, prompt, tests) for name, prompt, tests in mid_task_items()]
 
 
 def mbpp_prompt(row: dict) -> str | None:
@@ -534,10 +541,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--tasks",
-        choices=["loss", "smoke", "mbpp"],
+        choices=["loss", "smoke", "mid", "mbpp"],
         nargs="+",
         default=["smoke"],
-        help="Task sets to run, e.g. --tasks loss smoke (default: smoke).",
+        help="Task sets to run, e.g. --tasks loss smoke mid (default: smoke).",
     )
     parser.add_argument(
         "--val-tokens",
@@ -550,11 +557,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-n",
         type=int,
         default=None,
-        help="Sampled completions per code task, besides greedy (default: smoke 10, mbpp 5).",
+        help="Sampled completions per code task, besides greedy (default: smoke 10, mid 5, mbpp 5).",
     )
     parser.add_argument("--temperature", "-t", type=float, default=0.8)
     parser.add_argument("--top-k", type=int, default=50)
-    parser.add_argument("--max-new-tokens", type=int, default=None, help="Default: smoke 128, mbpp 160.")
+    parser.add_argument("--max-new-tokens", type=int, default=None, help="Default: smoke 128, mid 160, mbpp 160.")
     parser.add_argument("--limit", type=int, default=None, help="Only the first N code tasks.")
     parser.add_argument(
         "--out-dir",
@@ -677,7 +684,7 @@ def main(argv: list[str] | None = None) -> None:
     for name in args.tasks:
         if name == "loss":
             continue
-        tasks = smoke_tasks() if name == "smoke" else mbpp_tasks()
+        tasks = {"smoke": smoke_tasks, "mid": mid_tasks, "mbpp": mbpp_tasks}[name]()
         code_sets[name] = tasks[: args.limit] if args.limit is not None else tasks
         samples = args.samples if args.samples is not None else DEFAULT_SAMPLES[name]
         print(
