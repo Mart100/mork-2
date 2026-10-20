@@ -2,8 +2,8 @@
 
 Code tasks: the model continues a function header and docstring. The body is
 cut at the first unindented line, then run with the task's asserts in a
-subprocess (``python -I``, temp cwd, 5 s timeout). This is isolation from the
-eval process, not a security sandbox.
+subprocess (``python -s -P``, empty env except a fixed hash seed, temp cwd,
+5 s timeout). This is isolation from the eval process, not a security sandbox.
 
 Task sets:
   loss   Loss on the first --val-tokens of the shuffled val stream (a superset
@@ -20,12 +20,14 @@ Each checkpoint appends one row per task set to ``loss_eval.csv`` or
 import argparse
 import csv
 import json
+import os
 import re
 import subprocess
 import sys
 import tempfile
 import time
 import warnings
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -205,9 +207,11 @@ def run_program(program: str, workdir: str) -> tuple[bool, bool]:
     except Exception:
         return False, False
     try:
+        # Like -I, but with a fixed hash seed so set/dict-order answers pass or fail consistently.
         result = subprocess.run(
-            [sys.executable, "-I", "-c", program],
+            [sys.executable, "-s", "-P", "-c", program],
             cwd=workdir,
+            env={"PYTHONHASHSEED": "0", "PATH": os.environ.get("PATH", "")},
             capture_output=True,
             timeout=5,
             stdin=subprocess.DEVNULL,
@@ -231,7 +235,6 @@ def sample(
     seed: int,
 ) -> list[str]:
     """``n`` completions in one batch; ``temperature == 0`` is greedy."""
-    block = model.config.block_size
     end_id = tokenizer.special_token_id("<|end|>")
     gen = torch.Generator(device=device)
     gen.manual_seed(seed)
@@ -239,10 +242,13 @@ def sample(
     prompt_len = len(prompt_ids)
     rows = list(range(n))  # original sample index of each row still in idx
     done: dict[int, list[int]] = {}
+    kv_cache = model.new_kv_cache()
+    n_new = prompt_len
     for step in range(max_new_tokens):
         with torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=device == "cuda"):
-            logits, _ = model(idx[:, -block:])
-        logits = logits[:, -1, :].float()
+            logits = model.next_logits(idx, kv_cache, n_new)
+        n_new = 1
+        logits = logits.float()
         if temperature <= 0:
             nxt = logits.argmax(dim=-1, keepdim=True)
         else:
@@ -264,6 +270,7 @@ def sample(
             if len(keep) < len(rows):
                 idx = idx[keep]
                 rows = [rows[j] for j in keep]
+                kv_cache.keep_rows(torch.tensor(keep, device=idx.device))
     for j, out in enumerate(idx[:, prompt_len:].tolist()):
         done.setdefault(rows[j], out)
     return [tokenizer.decode(done[i]) for i in range(n)]
@@ -281,30 +288,37 @@ def evaluate_tasks(
     device: str,
     seed: int,
     verbose: bool,
+    workers: int = 8,
 ) -> tuple[dict, list[dict]]:
     per_task = []
-    with tempfile.TemporaryDirectory() as workdir:
+    # Tests run in a thread pool while the GPU generates the next task.
+    pending: list[tuple[Task, str, list[Future]]] = []
+    with tempfile.TemporaryDirectory() as workdir, ThreadPoolExecutor(workers) as pool:
         for i, task in enumerate(tasks):
             ids = tokenizer.encode(task.prompt)
             common = dict(max_new_tokens=max_new_tokens, top_k=top_k, device=device)
-            greedy = sample(model, tokenizer, ids, n=1, temperature=0.0, seed=seed, **common)[0]
-            greedy_body = extract_body(greedy)
-            g_syntax, g_pass = run_program(
-                task.setup + task.prompt + greedy_body + "\n\n" + task.tests, workdir
-            )
-            s_syntax = s_pass = 0
+            outs = sample(model, tokenizer, ids, n=1, temperature=0.0, seed=seed, **common)
             if samples > 0:
-                outs = sample(
+                outs += sample(
                     model, tokenizer, ids, n=samples, temperature=temperature,
                     seed=seed + 1000 + i, **common,
                 )
-                for out in outs:
-                    ok_syntax, ok = run_program(
-                        task.setup + task.prompt + extract_body(out) + "\n\n" + task.tests,
-                        workdir,
-                    )
-                    s_syntax += ok_syntax
-                    s_pass += ok
+            bodies = [extract_body(out) for out in outs]
+            futures = [
+                pool.submit(
+                    run_program, task.setup + task.prompt + body + "\n\n" + task.tests, workdir
+                )
+                for body in bodies
+            ]
+            pending.append((task, bodies[0], futures))
+            if not verbose and (i + 1) % 25 == 0:
+                print(f"  {i + 1}/{len(tasks)} tasks generated", flush=True)
+
+        for task, greedy_body, futures in pending:
+            results = [f.result() for f in futures]
+            g_syntax, g_pass = results[0]
+            s_syntax = sum(r[0] for r in results[1:])
+            s_pass = sum(r[1] for r in results[1:])
             per_task.append(
                 {
                     "task": task.name,
@@ -321,8 +335,6 @@ def evaluate_tasks(
                     f"sampled {s_pass}/{samples}",
                     flush=True,
                 )
-            elif (i + 1) % 25 == 0:
-                print(f"  {i + 1}/{len(tasks)} tasks", flush=True)
 
     n = len(tasks)
     n_samples = max(1, n * samples)
@@ -556,6 +568,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--verbose", "-v", action="store_true", help="Print one line per task.")
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=min(8, os.cpu_count() or 1),
+        help="Parallel test subprocesses (default: min(8, CPUs)).",
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="Re-run even if this checkpoint/task is already in the output CSV.",
@@ -589,6 +607,7 @@ def run_code_tasks(
         device=args.device,
         seed=args.seed,
         verbose=args.verbose,
+        workers=args.workers,
     )
     elapsed = time.time() - t0
     n = summary["n_tasks"]

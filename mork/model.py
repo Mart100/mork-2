@@ -45,6 +45,50 @@ class RotaryEmbedding(nn.Module):
         return self.cos_cached[:seq_len], self.sin_cached[:seq_len]
 
 
+class KVCache:
+    """Per-layer keys/values (after RoPE) for incremental decoding.
+
+    Buffers are allocated on first use with the dtype attention produces, so
+    autocast and fp32 inference both work. Positions are absolute: ``pos`` is
+    the number of tokens already cached, and can't exceed ``max_len``.
+    """
+
+    def __init__(self, n_layer: int, max_len: int):
+        self.n_layer = n_layer
+        self.max_len = max_len
+        self.k: list[torch.Tensor | None] = [None] * n_layer
+        self.v: list[torch.Tensor | None] = [None] * n_layer
+        self.pos = 0
+
+    def reset(self) -> None:
+        self.k = [None] * self.n_layer
+        self.v = [None] * self.n_layer
+        self.pos = 0
+
+    def update(
+        self, layer: int, k: torch.Tensor, v: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        B, H, T, D = k.shape
+        end = self.pos + T
+        if end > self.max_len:
+            raise ValueError(f"KV cache full: {end} > {self.max_len}")
+        if self.k[layer] is None:
+            self.k[layer] = k.new_zeros(B, H, self.max_len, D)
+            self.v[layer] = v.new_zeros(B, H, self.max_len, D)
+        k_buf, v_buf = self.k[layer], self.v[layer]
+        assert k_buf is not None and v_buf is not None
+        k_buf[:, :, self.pos : end] = k
+        v_buf[:, :, self.pos : end] = v
+        return k_buf[:, :, :end], v_buf[:, :, :end]
+
+    def keep_rows(self, rows: torch.Tensor) -> None:
+        """Drop batch rows (e.g. finished samples); ``rows`` indexes the kept ones."""
+        for i in range(self.n_layer):
+            if self.k[i] is not None:
+                self.k[i] = self.k[i].index_select(0, rows)
+                self.v[i] = self.v[i].index_select(0, rows)
+
+
 class RMSNorm(nn.Module):
     """LLaMA-style RMSNorm (no mean center, scale-only, no bias)."""
 
@@ -71,7 +115,12 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
 
     def forward(
-        self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        kv_cache: KVCache | None = None,
+        layer: int = 0,
     ) -> torch.Tensor:
         B, T, C = x.size()
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
@@ -81,13 +130,26 @@ class CausalSelfAttention(nn.Module):
 
         q, k = apply_rotary_emb(q, k, cos, sin)
 
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            is_causal=True,
-            dropout_p=self.attn_dropout if self.training else 0.0,
-        )
+        if kv_cache is None:
+            y = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                is_causal=True,
+                dropout_p=self.attn_dropout if self.training else 0.0,
+            )
+        else:
+            start = kv_cache.pos
+            k, v = kv_cache.update(layer, k, v)
+            if T == 1:
+                y = F.scaled_dot_product_attention(q, k, v)
+            elif start == 0:
+                y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            else:
+                # New query i sits at absolute position start + i.
+                rows = torch.arange(T, device=x.device).unsqueeze(1) + start
+                cols = torch.arange(start + T, device=x.device).unsqueeze(0)
+                y = F.scaled_dot_product_attention(q, k, v, attn_mask=cols <= rows)
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.resid_dropout(self.c_proj(y))
@@ -119,9 +181,14 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(
-        self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        kv_cache: KVCache | None = None,
+        layer: int = 0,
     ) -> torch.Tensor:
-        x = x + self.attn(self.ln_1(x), cos, sin)
+        x = x + self.attn(self.ln_1(x), cos, sin, kv_cache, layer)
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -161,17 +228,25 @@ class GPT(nn.Module):
         idx: torch.Tensor,
         targets: torch.Tensor | None = None,
         ignore_index: int = -100,
+        kv_cache: KVCache | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         B, T = idx.size()
-        assert T <= self.config.block_size, (
-            f"Cannot forward sequence of length {T}, "
+        start = 0 if kv_cache is None else kv_cache.pos
+        assert start + T <= self.config.block_size, (
+            f"Cannot forward sequence of length {start + T}, "
             f"block size is only {self.config.block_size}"
         )
-        cos, sin = self.rotary(T)
+        if kv_cache is None:
+            cos, sin = self.rotary(T)
+        else:
+            cos = self.rotary.cos_cached[start : start + T]
+            sin = self.rotary.sin_cached[start : start + T]
 
         x = self.drop(self.wte(idx))
-        for block in self.h:
-            x = block(x, cos, sin)
+        for i, block in enumerate(self.h):
+            x = block(x, cos, sin, kv_cache, i)
+        if kv_cache is not None:
+            kv_cache.pos += T
         x = self.ln_f(x)
         logits = self.lm_head(x)
 
@@ -185,3 +260,22 @@ class GPT(nn.Module):
                 ignore_index=ignore_index,
             )
         return logits, loss
+
+    def new_kv_cache(self) -> KVCache:
+        return KVCache(self.config.n_layer, self.config.block_size)
+
+    @torch.no_grad()
+    def next_logits(self, ids: torch.Tensor, kv_cache: KVCache, n_new: int) -> torch.Tensor:
+        """Logits for the token after ``ids`` (B, L); its last ``n_new`` tokens aren't cached yet.
+
+        Past block_size the cache is rebuilt from the last 3/4 of the context,
+        since positions beyond block_size were never trained.
+        """
+        block = self.config.block_size
+        if kv_cache.pos > 0 and kv_cache.pos + n_new <= block:
+            logits, _ = self(ids[:, -n_new:], kv_cache=kv_cache)
+        else:
+            keep = min(ids.size(1), block if kv_cache.pos == 0 else (3 * block) // 4)
+            kv_cache.reset()
+            logits, _ = self(ids[:, -keep:], kv_cache=kv_cache)
+        return logits[:, -1, :]

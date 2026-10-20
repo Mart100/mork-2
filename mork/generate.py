@@ -145,10 +145,11 @@ def generate(
         torch.cuda.synchronize()
     t0 = time.perf_counter()
 
+    kv_cache = model.new_kv_cache()
+    n_new = prompt_len
     for _ in range(max_new_tokens):
-        context = idx[:, -model.config.block_size :]
-        logits, _ = model(context)
-        logits = logits[:, -1, :] / temperature
+        logits = model.next_logits(idx, kv_cache, n_new) / temperature
+        n_new = 1
 
         if top_k > 0:
             k = min(top_k, logits.size(-1))
