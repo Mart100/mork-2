@@ -355,6 +355,86 @@ def append_csv(path: Path, row: dict, fields: list[str]) -> None:
         writer.writerow(row)
 
 
+def _ckpt_key(path: Path) -> str:
+    return str(path.expanduser().resolve())
+
+
+def _read_csv_rows(path: Path) -> list[dict[str, str]]:
+    if not path.exists():
+        return []
+    with path.open(newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def _eval_csv_paths(filename: str, out_dir: Path | None = None) -> list[Path]:
+    """CSVs to consult for skip: optional out_dir first, then every runs/*/filename."""
+    seen: set[Path] = set()
+    paths: list[Path] = []
+    candidates = []
+    if out_dir is not None:
+        candidates.append(out_dir / filename)
+    candidates.extend(sorted(FALLBACK_DIR.glob(f"*/{filename}")))
+    for path in candidates:
+        key = path.resolve()
+        if key in seen or not path.exists():
+            continue
+        seen.add(key)
+        paths.append(path)
+    return paths
+
+
+def already_scored_loss(path: Path, val_tokens: int, out_dir: Path | None = None) -> Path | None:
+    """Return the CSV that already has this checkpoint, or None."""
+    key = _ckpt_key(path)
+    for csv_path in _eval_csv_paths("loss_eval.csv", out_dir):
+        for row in _read_csv_rows(csv_path):
+            if _ckpt_key(Path(row["checkpoint"])) == key and int(row["val_tokens"]) == val_tokens:
+                return csv_path
+    return None
+
+
+def already_scored_code(
+    path: Path,
+    *,
+    tasks: str,
+    samples: int,
+    temperature: float,
+    top_k: int,
+    n_tasks: int,
+    out_dir: Path | None = None,
+) -> Path | None:
+    key = _ckpt_key(path)
+    for csv_path in _eval_csv_paths("code_eval.csv", out_dir):
+        for row in _read_csv_rows(csv_path):
+            if _ckpt_key(Path(row["checkpoint"])) != key:
+                continue
+            if row.get("tasks") != tasks:
+                continue
+            if int(row.get("samples", -1)) != samples:
+                continue
+            if abs(float(row.get("temperature", -1)) - temperature) > 1e-9:
+                continue
+            if int(row.get("top_k", -1)) != top_k:
+                continue
+            if int(row.get("n_tasks", -1)) != n_tasks:
+                continue
+            return csv_path
+    return None
+
+
+def resolve_out_dir(path: Path, out_dir: Path | None) -> Path:
+    if out_dir is not None:
+        return out_dir
+    parent = path.resolve().parent
+    # Branch dirs: checkpoints/cool_18k/latest.pt -> runs/cool_18k
+    if parent.parent == (PROJECT_ROOT / "checkpoints").resolve() and parent.name != "checkpoints":
+        candidate = FALLBACK_DIR / parent.name
+        if candidate.is_dir():
+            return candidate
+    run_dir = checkpoint_run_dir(path)
+    return run_dir if run_dir is not None else FALLBACK_DIR
+
+
 @dataclass
 class LossData:
     val_batches: list[tuple[torch.Tensor, torch.Tensor]]
@@ -475,6 +555,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--verbose", "-v", action="store_true", help="Print one line per task.")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-run even if this checkpoint/task is already in the output CSV.",
+    )
     args = parser.parse_args(argv)
     args.tasks = list(dict.fromkeys(args.tasks))
     return args
@@ -569,7 +654,6 @@ def main(argv: list[str] | None = None) -> None:
             raise SystemExit(f"checkpoint not found: {path}")
 
     torch.set_float32_matmul_precision("high")
-    tokenizer = MorkTokenizer.load(args.tokenizer)
     code_sets: dict[str, list[Task]] = {}
     for name in args.tasks:
         if name == "loss":
@@ -581,15 +665,53 @@ def main(argv: list[str] | None = None) -> None:
             f"{name}: {len(code_sets[name])} tasks, greedy + {samples} samples "
             f"(temperature {args.temperature}, top-k {args.top_k})"
         )
-    loss_data = build_loss_data(tokenizer, args.val_tokens) if "loss" in args.tasks else None
+
+    work: list[tuple[Path, list[str]]] = []
+    for path in args.checkpoint:
+        pending: list[str] = []
+        for name in args.tasks:
+            if args.force:
+                pending.append(name)
+                continue
+            if name == "loss":
+                hit = already_scored_loss(path, args.val_tokens, args.out_dir)
+                if hit is not None:
+                    print(f"skip {path} loss (already in {hit})")
+                else:
+                    pending.append(name)
+                continue
+            samples = args.samples if args.samples is not None else DEFAULT_SAMPLES[name]
+            tasks_label = name if args.limit is None else f"{name}[:{args.limit}]"
+            hit = already_scored_code(
+                path,
+                tasks=tasks_label,
+                samples=samples,
+                temperature=args.temperature,
+                top_k=args.top_k,
+                n_tasks=len(code_sets[name]),
+                out_dir=args.out_dir,
+            )
+            if hit is not None:
+                print(f"skip {path} {tasks_label} (already in {hit})")
+            else:
+                pending.append(name)
+        if pending:
+            work.append((path, pending))
+    if not work:
+        print("nothing to do")
+        return
+
+    tokenizer = MorkTokenizer.load(args.tokenizer)
+    need_loss = any("loss" in pending for _, pending in work)
+    loss_data = build_loss_data(tokenizer, args.val_tokens) if need_loss else None
 
     details: dict[str, dict] = {}
-    for path in args.checkpoint:
+    for path, pending in work:
+        out_dir = resolve_out_dir(path, args.out_dir)
         model, _, step, _ = load_model_for_inference(path, device=args.device)
-        out_dir = args.out_dir or checkpoint_run_dir(path) or FALLBACK_DIR
         print(f"{path} (step {step}) -> {out_dir}", flush=True)
         details[str(path)] = {"step": step}
-        for name in args.tasks:
+        for name in pending:
             if name == "loss":
                 assert loss_data is not None
                 details[str(path)][name] = run_loss_task(model, loss_data, args, path, step, out_dir)
