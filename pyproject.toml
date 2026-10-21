@@ -15,6 +15,7 @@ mork-train = "mork.train:main"
 mork-generate = "mork.generate:main"
 mork-prepare = "mork.prepare:main"
 mork-sft-prepare = "mork.sft_prepare:main"
+mork-sft = "mork.sft:main"
 mork-eval = "mork.evaluate:main"
 
 [build-system]

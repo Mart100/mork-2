@@ -1,9 +1,14 @@
 """Milestone evaluation for Mork-2 checkpoints: held-out loss and Python functions.
 
-Code tasks: the model continues a function header and docstring. The body is
-cut at the first unindented line, then run with the task's asserts in a
-subprocess (``python -s -P``, empty env except a fixed hash seed, temp cwd,
-5 s timeout). This is isolation from the eval process, not a security sandbox.
+Code tasks default to completion: the model continues a function header and
+docstring. The body is cut at the first unindented line, then run with the
+task's asserts in a subprocess (``python -s -P``, empty env except a fixed
+hash seed, temp cwd, 5 s timeout). This is isolation from the eval process,
+not a security sandbox.
+
+``--format instruct`` asks for the whole function after ``<|assistant|>``.
+Those rows are stored as ``smoke-instruct``, ``mid-instruct``, and
+``mbpp-instruct``. The completion rows are unchanged.
 
 Task sets:
   loss   Loss on the first --val-tokens of the shuffled val stream (a superset
@@ -205,6 +210,84 @@ def extract_body(completion: str) -> str:
     return text.rstrip() + "\n"
 
 
+_FENCE_RE = re.compile(r"```(?:python|py)?\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
+_CODE_START_RE = re.compile(r"(?m)^(import |from |def |async def |class |@)")
+_DOC_RE = re.compile(r'"""(.*?)"""', re.DOTALL)
+_DOCTEST_RE = re.compile(r">>>\s*(.+)\n[ \t]*(.+)")
+_ASSERT_RE = re.compile(r"assert\s+(.+?)\s*==\s*(.+)")
+
+
+def instruction_from_stub(prompt: str) -> str:
+    """Prose instruction for a completion stub, in the SFT user-turn style."""
+    match = DEF_RE.search(prompt)
+    if match is None:
+        raise ValueError("stub has no def line")
+    name, params = match.group(1), match.group(2).strip()
+    doc_match = _DOC_RE.search(prompt)
+    doc = doc_match.group(1) if doc_match else ""
+    prose, call, result = _split_doc(doc)
+    sentence = f"Write a Python function `{name}({params})`."
+    if prose:
+        sentence += f" {prose}"
+    if call is not None and result is not None:
+        sentence += f" Example: `{call}` returns `{result}`."
+    return sentence
+
+
+def _split_doc(doc: str) -> tuple[str, str | None, str | None]:
+    doctest = _DOCTEST_RE.search(doc)
+    if doctest:
+        prose = " ".join(doc[: doctest.start()].split())
+        return prose, doctest.group(1).strip(), doctest.group(2).strip()
+    assertion = _ASSERT_RE.search(doc)
+    if assertion:
+        prose = " ".join(doc[: assertion.start()].split())
+        return prose, assertion.group(1).strip(), assertion.group(2).strip()
+    return " ".join(doc.split()), None, None
+
+
+def instruct_prompt(instruction: str) -> str:
+    return f"<|user|>\n{instruction.strip()}\n<|assistant|>\n"
+
+
+def extract_source(completion: str) -> str:
+    """Whole program from an instruct completion: a fence, or the first function."""
+    text = completion.split("<|end|>", 1)[0]
+    fences = [block.strip() for block in _FENCE_RE.findall(text) if block.strip()]
+    if fences:
+        body = "\n\n".join(fences)
+    else:
+        match = _CODE_START_RE.search(text)
+        body = text[match.start() :] if match else text
+        body = _cut_after_program(body)
+    return body.rstrip() + "\n"
+
+
+def _cut_after_program(text: str) -> str:
+    """Keep leading imports and the first function. Drop a later top-level line."""
+    lines = text.splitlines(keepends=True)
+    if not lines:
+        return text
+    saw_def = False
+    keep = len(lines)
+    for i, line in enumerate(lines):
+        stripped = line.lstrip()
+        is_header = stripped.startswith(("import ", "from ", "def ", "async def ", "class ", "@"))
+        if i == 0:
+            if stripped.startswith(("def ", "async def ", "class ")):
+                saw_def = True
+            continue
+        if not line.strip() or line[0].isspace():
+            continue
+        if not saw_def and is_header:
+            if stripped.startswith(("def ", "async def ", "class ")):
+                saw_def = True
+            continue
+        keep = i
+        break
+    return "".join(lines[:keep])
+
+
 def run_program(program: str, workdir: str) -> tuple[bool, bool]:
     """Returns (compiles, passes)."""
     try:
@@ -240,8 +323,13 @@ def sample(
     top_k: int,
     device: str,
     seed: int,
+    stop_at_toplevel: bool = True,
 ) -> list[str]:
-    """``n`` completions in one batch; ``temperature == 0`` is greedy."""
+    """``n`` completions in one batch; ``temperature == 0`` is greedy.
+
+    Completion mode stops at the first new top-level line. Instruct mode
+    stops only at ``<|end|>``, because the reply is a whole function.
+    """
     end_id = tokenizer.special_token_id("<|end|>")
     gen = torch.Generator(device=device)
     gen.manual_seed(seed)
@@ -268,7 +356,10 @@ def sample(
         if step % 8 == 7:
             keep = []
             for j, out in enumerate(idx[:, prompt_len:].tolist()):
-                if end_id in out or toplevel_cut(tokenizer.decode(out)) is not None:
+                finished = end_id in out or (
+                    stop_at_toplevel and toplevel_cut(tokenizer.decode(out)) is not None
+                )
+                if finished:
                     done[rows[j]] = out
                 else:
                     keep.append(j)
@@ -296,27 +387,37 @@ def evaluate_tasks(
     seed: int,
     verbose: bool,
     workers: int = 8,
+    format: str = "completion",
 ) -> tuple[dict, list[dict]]:
     per_task = []
     # Tests run in a thread pool while the GPU generates the next task.
     pending: list[tuple[Task, str, list[Future]]] = []
+    instruct = format == "instruct"
     with tempfile.TemporaryDirectory() as workdir, ThreadPoolExecutor(workers) as pool:
         for i, task in enumerate(tasks):
-            ids = tokenizer.encode(task.prompt)
-            common = dict(max_new_tokens=max_new_tokens, top_k=top_k, device=device)
+            prompt = instruct_prompt(instruction_from_stub(task.prompt)) if instruct else task.prompt
+            ids = tokenizer.encode(prompt)
+            common = dict(
+                max_new_tokens=max_new_tokens,
+                top_k=top_k,
+                device=device,
+                stop_at_toplevel=not instruct,
+            )
             outs = sample(model, tokenizer, ids, n=1, temperature=0.0, seed=seed, **common)
             if samples > 0:
                 outs += sample(
                     model, tokenizer, ids, n=samples, temperature=temperature,
                     seed=seed + 1000 + i, **common,
                 )
-            bodies = [extract_body(out) for out in outs]
-            futures = [
-                pool.submit(
-                    run_program, task.setup + task.prompt + body + "\n\n" + task.tests, workdir
-                )
-                for body in bodies
-            ]
+            if instruct:
+                bodies = [extract_source(out) for out in outs]
+                programs = [task.setup + body + "\n" + task.tests for body in bodies]
+            else:
+                bodies = [extract_body(out) for out in outs]
+                programs = [
+                    task.setup + task.prompt + body + "\n\n" + task.tests for body in bodies
+                ]
+            futures = [pool.submit(run_program, program, workdir) for program in programs]
             pending.append((task, bodies[0], futures))
             if not verbose and (i + 1) % 25 == 0:
                 print(f"  {i + 1}/{len(tasks)} tasks generated", flush=True)
@@ -581,6 +682,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Parallel test subprocesses (default: min(8, CPUs)).",
     )
     parser.add_argument(
+        "--format",
+        choices=["completion", "instruct"],
+        default="completion",
+        help=(
+            "completion continues the function stub. instruct asks for the "
+            "whole function after <|assistant|> and records smoke-instruct, "
+            "mid-instruct, mbpp-instruct (default: completion)."
+        ),
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="Re-run even if this checkpoint/task is already in the output CSV.",
@@ -588,6 +699,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     args.tasks = list(dict.fromkeys(args.tasks))
     return args
+
+
+def code_task_label(name: str, args: argparse.Namespace) -> str:
+    label = f"{name}-instruct" if args.format == "instruct" else name
+    if args.limit is not None:
+        label = f"{label}[:{args.limit}]"
+    return label
 
 
 def run_code_tasks(
@@ -615,11 +733,13 @@ def run_code_tasks(
         seed=args.seed,
         verbose=args.verbose,
         workers=args.workers,
+        format=args.format,
     )
     elapsed = time.time() - t0
     n = summary["n_tasks"]
+    label = code_task_label(name, args)
     print(
-        f"  {name}: greedy {summary['greedy_pass']}/{n} "
+        f"  {label}: greedy {summary['greedy_pass']}/{n} "
         f"(syntax {summary['greedy_syntax']}/{n}), "
         f"sampled pass@1 {summary['sample_pass_at_1']:.3f}, "
         f"pass@{samples} {summary['tasks_solved']}/{n}, "
@@ -632,7 +752,7 @@ def run_code_tasks(
             "time": datetime.now(timezone.utc).isoformat(),
             "checkpoint": str(path),
             "step": step,
-            "tasks": name if args.limit is None else f"{name}[:{args.limit}]",
+            "tasks": label,
             "samples": samples,
             "temperature": args.temperature,
             "top_k": args.top_k,
@@ -688,7 +808,8 @@ def main(argv: list[str] | None = None) -> None:
         code_sets[name] = tasks[: args.limit] if args.limit is not None else tasks
         samples = args.samples if args.samples is not None else DEFAULT_SAMPLES[name]
         print(
-            f"{name}: {len(code_sets[name])} tasks, greedy + {samples} samples "
+            f"{code_task_label(name, args)}: {len(code_sets[name])} tasks, "
+            f"greedy + {samples} samples "
             f"(temperature {args.temperature}, top-k {args.top_k})"
         )
 
@@ -707,7 +828,7 @@ def main(argv: list[str] | None = None) -> None:
                     pending.append(name)
                 continue
             samples = args.samples if args.samples is not None else DEFAULT_SAMPLES[name]
-            tasks_label = name if args.limit is None else f"{name}[:{args.limit}]"
+            tasks_label = code_task_label(name, args)
             hit = already_scored_code(
                 path,
                 tasks=tasks_label,

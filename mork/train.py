@@ -418,6 +418,8 @@ def main(
     argv: list[str] | None = None,
     train_cfg: TrainConfig | None = None,
     model_cfg: ModelConfig | None = None,
+    train_loader: DataLoaderLite | None = None,
+    val_loader: DataLoaderLite | None = None,
 ) -> None:
     # The console script calls main() with no configs, so flags have to be read here.
     if train_cfg is None and model_cfg is None:
@@ -441,22 +443,25 @@ def main(
     print(f"total desired batch size: {train_cfg.total_batch_size:,}")
     print(f"=> calculated gradient accumulation steps: {train_cfg.grad_accum_steps:,}")
 
-    train_loader = DataLoaderLite(
-        B=train_cfg.batch_size,
-        T=train_cfg.seq_len,
-        split="train",
-        data_dir=train_cfg.data_dir,
-        shuffle_chunk_tokens=train_cfg.shuffle_chunk_tokens,
-    )
-    val_loader = DataLoaderLite(
-        B=train_cfg.batch_size,
-        T=train_cfg.seq_len,
-        split="val",
-        data_dir=train_cfg.data_dir,
-        shuffle_chunk_tokens=train_cfg.shuffle_chunk_tokens,
-        fixed_shuffle=True,
-        shuffle_seed=train_cfg.seed,
-    )
+    if (train_loader is None) != (val_loader is None):
+        raise ValueError("pass both loaders or neither")
+    if train_loader is None or val_loader is None:
+        train_loader = DataLoaderLite(
+            B=train_cfg.batch_size,
+            T=train_cfg.seq_len,
+            split="train",
+            data_dir=train_cfg.data_dir,
+            shuffle_chunk_tokens=train_cfg.shuffle_chunk_tokens,
+        )
+        val_loader = DataLoaderLite(
+            B=train_cfg.batch_size,
+            T=train_cfg.seq_len,
+            split="val",
+            data_dir=train_cfg.data_dir,
+            shuffle_chunk_tokens=train_cfg.shuffle_chunk_tokens,
+            fixed_shuffle=True,
+            shuffle_seed=train_cfg.seed,
+        )
 
     torch.set_float32_matmul_precision("high")
 
@@ -566,6 +571,11 @@ def main(
             dtype=dtype,
             max_dt_s=train_cfg.auto_batch_max_dt_s,
         )
+
+    if start_step == 0:
+        # Probe steps read ahead. Rewind so step 0 starts at the first batch.
+        train_loader.reset()
+        val_loader.reset()
 
     # Write configs after probe so batch_size / grad_accum reflect the choice.
     metrics.write_configs(model_cfg, train_cfg)
